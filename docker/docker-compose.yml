@@ -1,0 +1,104 @@
+# Sequoia-HQ — full deployment stack.
+#
+# Stateful services (postgres, minio, redis, keycloak) are also declared here
+# so a single `docker compose up` brings up the whole HQ. Production requires
+# secrets to be supplied via the environment (see app/config.py — the services
+# fail closed unless SEQUOIAHQ_ENV=production and real secrets are set).
+#
+# Usage:  docker compose -f docker/docker-compose.yml --env-file .env up -d
+name: sequoiahq
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${SEQUOIAHQ_DB_USER:-sequoiahq}
+      POSTGRES_PASSWORD: ${SEQUOIAHQ_DB_PASSWORD:-sequoiahq}
+      POSTGRES_DB: ${SEQUOIAHQ_DB_NAME:-sequoiahq}
+    volumes:
+      - sequoiahq-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${SEQUOIAHQ_S3_ACCESS_KEY:-sequoiahq}
+      MINIO_ROOT_PASSWORD: ${SEQUOIAHQ_S3_SECRET_KEY:-sequoiahq-dev-secret}
+    volumes:
+      - sequoiahq-minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    environment: &api-env
+      SEQUOIAHQ_ENV: ${SEQUOIAHQ_ENV:-production}
+      SEQUOIAHQ_DATABASE_URL: postgresql+asyncpg://${ACADIAQ_DB_USER:-sequoiahq}:${ACADIAQ_DB_PASSWORD:-sequoiahq}@postgres:5432/${ACADIAQ_DB_NAME:-sequoiahq}
+      SEQUOIAHQ_REDIS_URL: redis://redis:6379/0
+      SEQUOIAHQ_S3_ENDPOINT_URL: http://minio:9000
+      SEQUOIAHQ_S3_ACCESS_KEY: ${SEQUOIAHQ_S3_ACCESS_KEY:-sequoiahq}
+      SEQUOIAHQ_S3_SECRET_KEY: ${SEQUOIAHQ_S3_SECRET_KEY:-sequoiahq-dev-secret}
+      SEQUOIAHQ_S3_BUCKET: ${SEQUOIAHQ_S3_BUCKET:-sequoiahq}
+      SEQUOIAHQ_OIDC_ISSUER: ${SEQUOIAHQ_OIDC_ISSUER:?set SEQUOIAHQ_OIDC_ISSUER}
+      SEQUOIAHQ_OIDC_CLIENT_ID: ${SEQUOIAHQ_OIDC_CLIENT_ID:-sequoiahq-api}
+      SEQUOIAHQ_OIDC_CLIENT_SECRET: ${SEQUOIAHQ_OIDC_CLIENT_SECRET:?set SEQUOIAHQ_OIDC_CLIENT_SECRET}
+      SEQUOIAHQ_SESSION_SECRET_KEY: ${SEQUOIAHQ_SESSION_SECRET_KEY:?set SEQUOIAHQ_SESSION_SECRET_KEY}
+      SEQUOIAHQ_CORS_ALLOW_ORIGINS: ${SEQUOIAHQ_CORS_ALLOW_ORIGINS:-http://localhost:8080}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      - "${SEQUOIAHQ_API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: python -m gateway.server
+    environment: *api-env
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${SEQUOIAHQ_GATEWAY_PORT:-50051}:50051"
+
+  web:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.web
+    depends_on:
+      - api
+    ports:
+      - "${SEQUOIAHQ_WEB_PORT:-8080}:80"
+
+volumes:
+  sequoiahq-pg-data:
+  sequoiahq-minio-data:
